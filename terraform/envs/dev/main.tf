@@ -253,3 +253,133 @@ output "db_subnet_ids" {
   description = "Private database subnet IDs"
   value       = { for key, subnet in aws_subnet.db : key => subnet.id }
 }
+
+# NAT instance for outbound internet access from private app subnets.
+# Cost-conscious demo design: one NAT instance shared by both app subnets.
+
+data "aws_ami" "amazon_linux_2023" {
+  most_recent = true
+  owners      = ["137112412989"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-2023.*-x86_64"]
+  }
+
+  filter {
+    name   = "architecture"
+    values = ["x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+resource "aws_security_group" "nat" {
+  name        = "${var.project_name}-${var.environment}-nat-sg"
+  description = "NAT traffic from private application subnets"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "Forward app subnet outbound traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = [
+      local.app_subnets.app_a.cidr,
+      local.app_subnets.app_b.cidr
+    ]
+  }
+
+  egress {
+    description = "Outbound internet traffic"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-nat-sg"
+  })
+}
+
+resource "aws_instance" "nat" {
+  ami                         = data.aws_ami.amazon_linux_2023.id
+  instance_type               = "t3.micro"
+  subnet_id                   = aws_subnet.public["public_a"].id
+  vpc_security_group_ids      = [aws_security_group.nat.id]
+  associate_public_ip_address = true
+  source_dest_check           = false
+
+  metadata_options {
+    http_tokens = "required"
+  }
+
+  user_data = <<-USERDATA
+    #!/bin/bash
+    set -euxo pipefail
+
+    dnf install -y iptables
+
+    cat > /usr/local/sbin/configure-nat.sh <<'SCRIPT'
+    #!/bin/bash
+    set -euo pipefail
+
+    sysctl -w net.ipv4.ip_forward=1
+    echo 'net.ipv4.ip_forward = 1' > /etc/sysctl.d/99-nat.conf
+
+    iptables -t nat -C POSTROUTING -s 10.20.0.0/16 -o ens5 -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -s 10.20.0.0/16 -o ens5 -j MASQUERADE
+
+    iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    iptables -C FORWARD -s 10.20.0.0/16 -j ACCEPT 2>/dev/null || \
+      iptables -A FORWARD -s 10.20.0.0/16 -j ACCEPT
+    SCRIPT
+
+    chmod 750 /usr/local/sbin/configure-nat.sh
+
+    cat > /etc/systemd/system/nat-iptables.service <<'SERVICE'
+    [Unit]
+    Description=Configure NAT forwarding and iptables rules
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=oneshot
+    ExecStart=/usr/local/sbin/configure-nat.sh
+    RemainAfterExit=yes
+
+    [Install]
+    WantedBy=multi-user.target
+    SERVICE
+
+    systemctl daemon-reload
+    systemctl enable --now nat-iptables.service
+  USERDATA
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-nat"
+    Tier = "nat"
+  })
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+resource "aws_route" "app_default_via_nat" {
+  for_each = aws_route_table.app
+
+  route_table_id         = each.value.id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_instance.nat.primary_network_interface_id
+}
+
+output "nat_instance_id" {
+  description = "ID of the shared NAT instance"
+  value       = aws_instance.nat.id
+}
+
