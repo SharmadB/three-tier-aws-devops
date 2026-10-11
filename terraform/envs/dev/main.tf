@@ -434,7 +434,7 @@ resource "aws_lb_listener" "http" {
 # EC2 launch template: the application instances stay in private subnets.
 resource "aws_launch_template" "app" {
   name_prefix   = "${var.project_name}-${var.environment}-app-"
-  image_id      = data.aws_ami.amazon_linux_2023.id
+  image_id      = "ami-0d27e0fb3bac4d724"
   instance_type = "t3.micro"
 
   vpc_security_group_ids = [aws_security_group.app.id]
@@ -556,4 +556,66 @@ output "application_url" {
 output "app_asg_name" {
   description = "Application Auto Scaling Group name"
   value       = aws_autoscaling_group.app.name
+}
+
+# Private database tier
+resource "aws_db_subnet_group" "main" {
+  name        = "${var.project_name}-${var.environment}-db-subnets"
+  description = "Private subnets for the application database"
+  subnet_ids  = [for key in ["db_a", "db_b"] : aws_subnet.db[key].id]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-db-subnets"
+    Tier = "database"
+  })
+}
+
+resource "aws_db_instance" "main" {
+  identifier = "${var.project_name}-${var.environment}-mysql"
+
+  engine         = "mysql"
+  engine_version = "8.0"
+  instance_class = var.db_instance_class
+
+  allocated_storage     = 20
+  max_allocated_storage = 20
+  storage_type          = "gp3"
+  storage_encrypted     = true
+
+  db_name  = var.db_name
+  username = var.db_username
+
+  # Terraform generates the master password in AWS.
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.db.id]
+  publicly_accessible    = false
+  multi_az               = false
+
+  backup_retention_period = 0
+  deletion_protection     = false
+  skip_final_snapshot     = true
+
+  auto_minor_version_upgrade = true
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-mysql"
+    Tier = "database"
+  })
+}
+
+output "db_endpoint" {
+  description = "Private endpoint for the RDS database"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "db_name" {
+  description = "Initial database name"
+  value       = aws_db_instance.main.db_name
+}
+
+output "db_address" {
+  description = "Private hostname of the RDS database"
+  value       = aws_db_instance.main.address
 }

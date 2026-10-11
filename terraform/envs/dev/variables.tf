@@ -21,3 +21,21 @@ variable "environment" {
   type        = string
   default     = "dev"
 }
+
+variable "db_instance_class" {
+  description = "RDS instance class for the development database"
+  type        = string
+  default     = "db.t3.micro"
+}
+
+variable "db_name" {
+  description = "Initial application database name"
+  type        = string
+  default     = "threetierapp"
+}
+
+variable "db_username" {
+  description = "Master username for the development database"
+  type        = string
+  default     = "dbadmin"
+}
