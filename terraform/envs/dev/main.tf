@@ -307,7 +307,7 @@ resource "aws_security_group" "nat" {
 }
 
 resource "aws_instance" "nat" {
-  ami                         = data.aws_ami.amazon_linux_2023.id
+  ami                         = "ami-03c3da4cfa8e8943a"
   instance_type               = "t3.micro"
   subnet_id                   = aws_subnet.public["public_a"].id
   vpc_security_group_ids      = [aws_security_group.nat.id]
@@ -383,3 +383,177 @@ output "nat_instance_id" {
   value       = aws_instance.nat.id
 }
 
+
+# Public Application Load Balancer
+resource "aws_lb" "app" {
+  name               = "three-tier-dev-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = [for key in ["public_a", "public_b"] : aws_subnet.public[key].id]
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-alb"
+    Tier = "public"
+  })
+}
+
+resource "aws_lb_target_group" "app" {
+  name     = "three-tier-dev-tg"
+  port     = 5000
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.main.id
+
+  health_check {
+    enabled             = true
+    path                = "/health"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 30
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    timeout             = 5
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-tg"
+  })
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+}
+
+# EC2 launch template: the application instances stay in private subnets.
+resource "aws_launch_template" "app" {
+  name_prefix   = "${var.project_name}-${var.environment}-app-"
+  image_id      = data.aws_ami.amazon_linux_2023.id
+  instance_type = "t3.micro"
+
+  vpc_security_group_ids = [aws_security_group.app.id]
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  user_data = base64encode(<<-USERDATA
+#!/bin/bash
+set -euxo pipefail
+
+dnf install -y python3
+python3 -m venv /opt/three-tier-venv
+/opt/three-tier-venv/bin/pip install --upgrade pip
+/opt/three-tier-venv/bin/pip install Flask==3.1.2
+
+mkdir -p /opt/three-tier-app
+cat > /opt/three-tier-app/app.py <<'PYTHON'
+from flask import Flask, jsonify
+import socket
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return jsonify({
+        "project": "Three-Tier AWS DevOps",
+        "message": "Application tier is running!",
+        "instance": socket.gethostname()
+    })
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+PYTHON
+
+cat > /etc/systemd/system/three-tier-app.service <<'SERVICE'
+[Unit]
+Description=Three-Tier Flask Demo Application
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/three-tier-app
+ExecStart=/opt/three-tier-venv/bin/python /opt/three-tier-app/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now three-tier-app
+USERDATA
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = merge(local.common_tags, {
+      Name = "${var.project_name}-${var.environment}-app"
+      Tier = "application"
+    })
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-${var.environment}-app-lt"
+  })
+}
+
+resource "aws_autoscaling_group" "app" {
+  name                      = "${var.project_name}-${var.environment}-app-asg"
+  min_size                  = 1
+  desired_capacity          = 1
+  max_size                  = 2
+  vpc_zone_identifier       = [for key in ["app_a", "app_b"] : aws_subnet.app[key].id]
+  target_group_arns         = [aws_lb_target_group.app.arn]
+  health_check_type         = "ELB"
+  health_check_grace_period = 180
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${var.project_name}-${var.environment}-app"
+    propagate_at_launch = true
+  }
+
+  dynamic "tag" {
+    for_each = local.common_tags
+    content {
+      key                 = tag.key
+      value               = tag.value
+      propagate_at_launch = true
+    }
+  }
+}
+
+output "alb_dns_name" {
+  description = "Public DNS name of the application load balancer"
+  value       = aws_lb.app.dns_name
+}
+
+output "application_url" {
+  description = "HTTP URL for the demo application"
+  value       = "http://${aws_lb.app.dns_name}"
+}
+
+output "app_asg_name" {
+  description = "Application Auto Scaling Group name"
+  value       = aws_autoscaling_group.app.name
+}
